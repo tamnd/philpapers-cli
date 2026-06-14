@@ -1,52 +1,60 @@
 // Package philpapers is the library behind the philpapers command line:
-// the HTTP client, request shaping, and the typed data models for philpapers.
-//
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// the HTTP client, request shaping, and the typed data models for PhilPapers
+// philosophy papers fetched via the OAI-PMH endpoint.
 package philpapers
 
 import (
 	"context"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
+	"sync"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to philpapers. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "philpapers/dev (+https://github.com/tamnd/philpapers-cli)"
+const DefaultUserAgent = "Mozilla/5.0 (compatible; philpapers-cli/0.1; +https://github.com/tamnd/philpapers-cli)"
 
-// Client talks to philpapers over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// Config holds constructor parameters.
+type Config struct {
+	BaseURL   string
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
+	Rate      time.Duration
+	Retries   int
+	Timeout   time.Duration
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+// DefaultConfig returns sensible defaults.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   "https://philpapers.org",
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Rate:      1 * time.Second,
+		Retries:   3,
+		Timeout:   30 * time.Second,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client talks to the PhilPapers OAI-PMH endpoint.
+type Client struct {
+	cfg        Config
+	httpClient *http.Client
+	mu         sync.Mutex
+	last       time.Time
+}
+
+// NewClient returns a Client with the given config.
+func NewClient(cfg Config) *Client {
+	return &Client{
+		cfg:        cfg,
+		httpClient: &http.Client{Timeout: cfg.Timeout},
+	}
+}
+
+func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -54,27 +62,27 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		b, retry, err := c.do(ctx, rawURL)
 		if err == nil {
-			return body, nil
+			return b, nil
 		}
 		lastErr = err
 		if !retry {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get: %w", lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) ([]byte, bool, error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -87,19 +95,20 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
 	}
 
-	b, err := io.ReadAll(resp.Body)
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
 		return nil, true, err
 	}
 	return b, false, nil
 }
 
-// pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
@@ -111,4 +120,69 @@ func backoff(attempt int) time.Duration {
 		d = 5 * time.Second
 	}
 	return d
+}
+
+// Recent fetches recently added PhilPapers entries via OAI-PMH ListRecords.
+func (c *Client) Recent(ctx context.Context, limit int) ([]Paper, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	apiURL := c.cfg.BaseURL + "/oai.pl?verb=ListRecords&metadataPrefix=oai_dc"
+	raw, err := c.get(ctx, apiURL)
+	if err != nil {
+		return nil, err
+	}
+	return parseOAI(raw, limit), nil
+}
+
+func parseOAI(raw []byte, limit int) []Paper {
+	var doc oaiPMH
+	if err := xml.Unmarshal(raw, &doc); err != nil || doc.ListRecords == nil {
+		return nil
+	}
+	var out []Paper
+	for i, rec := range doc.ListRecords.Records {
+		if limit > 0 && i >= limit {
+			break
+		}
+		dc := rec.Metadata.DC
+		title := ""
+		if len(dc.Titles) > 0 {
+			title = dc.Titles[0]
+		}
+		author := ""
+		if len(dc.Creators) > 0 {
+			author = dc.Creators[0]
+		}
+		date := ""
+		if len(dc.Dates) > 0 {
+			date = dc.Dates[0]
+		}
+		subject := ""
+		if len(dc.Subjects) > 0 {
+			subject = dc.Subjects[0]
+		}
+		url := ""
+		for _, r := range dc.Relations {
+			if strings.HasPrefix(r, "http") {
+				url = r
+				break
+			}
+		}
+		// Extract ID from identifier: "oai:philpapers.org/rec/SMIT-123" -> "SMIT-123"
+		id := rec.Header.Identifier
+		if idx := strings.LastIndex(id, "/"); idx >= 0 {
+			id = id[idx+1:]
+		}
+		out = append(out, Paper{
+			Rank:    i + 1,
+			ID:      id,
+			Title:   title,
+			Author:  author,
+			Date:    date,
+			Subject: subject,
+			URL:     url,
+		})
+	}
+	return out
 }
